@@ -4,10 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       repositories:
-        description: 'Repositories to build (comma-separated: owner/repo, owner2/repo2)'
+        description: 'Repositories to build (comma-separated: owner/repo)'
         required: true
         type: string
-        default: 'owner/private-repo'
       
       advanced_config:
         description: 'Advanced JSON config (optional)'
@@ -36,9 +35,9 @@ on:
         options: [temurin, zulu, corretto, liberica, microsoft, oracle]
       
       gradle_tasks:
-        description: 'Gradle tasks'
+        description: 'Gradle tasks (auto-detected for Android if empty)'
         required: false
-        default: 'build'
+        default: ''
         type: string
       
       gradle_args:
@@ -72,17 +71,9 @@ on:
         required: false
         default: true
         type: boolean
-      
-      enable_build_scan:
-        description: 'Enable Gradle Build Scan'
-        required: false
-        default: false
-        type: boolean
 
 env:
   GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true"
-  # Use PAT for all git operations
-  GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN || github.token }}
 
 jobs:
   setup-matrix:
@@ -93,15 +84,6 @@ jobs:
       repo_count: ${{ steps.create-matrix.outputs.repo_count }}
     
     steps:
-      - name: Validate token
-        run: |
-          if [ -z "${{ secrets.REPO_ACCESS_TOKEN }}" ]; then
-            echo "::warning::REPO_ACCESS_TOKEN secret not set. Private repos will fail!"
-            echo "ℹ️ Using default GITHUB_TOKEN - only public repos will work"
-          else
-            echo "✅ REPO_ACCESS_TOKEN is configured"
-          fi
-
       - name: Create build matrix
         id: create-matrix
         uses: actions/github-script@v7
@@ -157,29 +139,6 @@ jobs:
               return;
             }
             
-            // Validate repos and check accessibility
-            for (const build of builds) {
-              if (!build.repository.match(/^[\w.-]+\/[\w.-]+$/)) {
-                core.setFailed(`Invalid repository format: ${build.repository}`);
-                return;
-              }
-              
-              // Check if repo is accessible
-              try {
-                const [owner, repo] = build.repository.split('/');
-                await github.rest.repos.get({ owner, repo });
-                console.log(`✅ ${build.repository} - accessible`);
-              } catch (e) {
-                if (e.status === 404) {
-                  core.setFailed(`❌ Repository not found or not accessible: ${build.repository}. Check your REPO_ACCESS_TOKEN permissions.`);
-                  return;
-                }
-                console.log(`⚠️ ${build.repository} - could not verify (${e.message})`);
-              }
-            }
-            
-            console.log(`\n📦 Building ${builds.length} repositories`);
-            
             const matrix = { include: builds };
             core.setOutput('matrix', JSON.stringify(matrix));
             core.setOutput('repo_count', builds.length);
@@ -188,7 +147,7 @@ jobs:
     name: 🔨 Build ${{ matrix.repository }}
     needs: setup-matrix
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
@@ -201,21 +160,11 @@ jobs:
         with:
           repository: ${{ matrix.repository }}
           ref: ${{ matrix.ref || '' }}
-          # THIS IS THE KEY FOR PRIVATE REPOS
           token: ${{ secrets.REPO_ACCESS_TOKEN || github.token }}
           fetch-depth: 0
           submodules: recursive
-          # For private submodules, persist credentials
-          persist-credentials: true
 
-      # Configure git to use token for any additional fetches
-      - name: 🔐 Configure Git credentials
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.REPO_ACCESS_TOKEN || github.token }}@github.com/".insteadOf "https://github.com/"
-          git config --global url."https://x-access-token:${{ secrets.REPO_ACCESS_TOKEN || github.token }}@github.com/".insteadOf "git@github.com:"
-        shell: bash
-
-      - name: 🔍 Detect Gradle configuration
+      - name: 🔍 Detect project type
         id: detect
         shell: bash
         run: |
@@ -224,25 +173,91 @@ jobs:
           echo "work_dir=$WORK_DIR" >> $GITHUB_OUTPUT
           
           echo "📂 Repository: ${{ matrix.repository }}"
+          echo "📁 Working directory: $WORK_DIR"
+          echo ""
           
-          if [ -f "$WORK_DIR/gradlew" ] || [ -f "$WORK_DIR/gradlew.bat" ]; then
+          # Detect wrapper
+          if [ -f "$WORK_DIR/gradlew" ]; then
             echo "has_wrapper=true" >> $GITHUB_OUTPUT
-            chmod +x "$WORK_DIR/gradlew" 2>/dev/null || true
+            chmod +x "$WORK_DIR/gradlew"
+            echo "✅ Gradle Wrapper found"
           else
             echo "has_wrapper=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No wrapper found"
           fi
           
+          # Detect build file type
           if [ -f "$WORK_DIR/build.gradle.kts" ]; then
             echo "build_type=kotlin" >> $GITHUB_OUTPUT
+            BUILD_FILE="$WORK_DIR/build.gradle.kts"
           elif [ -f "$WORK_DIR/build.gradle" ]; then
             echo "build_type=groovy" >> $GITHUB_OUTPUT
+            BUILD_FILE="$WORK_DIR/build.gradle"
           else
             echo "❌ No build.gradle(.kts) found!"
             exit 1
           fi
           
+          # ========================================
+          # DETECT ANDROID PROJECT
+          # ========================================
+          IS_ANDROID=false
+          
+          # Check for Android plugin in build files
+          if grep -rq "com.android.application\|com.android.library\|android {" "$WORK_DIR" --include="*.gradle*" 2>/dev/null; then
+            IS_ANDROID=true
+          fi
+          
+          # Check for Android directories
+          if [ -d "$WORK_DIR/app/src/main/AndroidManifest.xml" ] || \
+             [ -f "$WORK_DIR/app/src/main/AndroidManifest.xml" ] || \
+             find "$WORK_DIR" -name "AndroidManifest.xml" -type f 2>/dev/null | grep -q .; then
+            IS_ANDROID=true
+          fi
+          
+          # Check for local.properties (Android Studio creates this)
+          if [ -f "$WORK_DIR/local.properties" ]; then
+            IS_ANDROID=true
+          fi
+          
+          if [ "$IS_ANDROID" = true ]; then
+            echo "is_android=true" >> $GITHUB_OUTPUT
+            echo "📱 Android project detected!"
+          else
+            echo "is_android=false" >> $GITHUB_OUTPUT
+            echo "☕ Standard Java/Kotlin project"
+          fi
+          
+          # Determine default tasks
+          if [ -z "${{ matrix.gradle_tasks }}" ]; then
+            if [ "$IS_ANDROID" = true ]; then
+              echo "default_tasks=assembleDebug" >> $GITHUB_OUTPUT
+            else
+              echo "default_tasks=build" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "default_tasks=${{ matrix.gradle_tasks }}" >> $GITHUB_OUTPUT
+          fi
+          
+          # Repo name for artifacts
           REPO_NAME=$(echo "${{ matrix.repository }}" | tr '/' '-')
           echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+      # ========================================
+      # ANDROID SDK SETUP
+      # ========================================
+      - name: 📱 Setup Android SDK
+        if: steps.detect.outputs.is_android == 'true'
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
+          log-accepted-android-sdk-licenses: false
+
+      - name: 📱 Accept Android SDK Licenses
+        if: steps.detect.outputs.is_android == 'true'
+        shell: bash
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: ☕ Set up JDK ${{ matrix.java_version }}
         uses: actions/setup-java@v4
@@ -251,38 +266,90 @@ jobs:
           distribution: ${{ inputs.java_distribution }}
           cache: gradle
 
+      # ========================================
+      # FIX: ADD GOOGLE MAVEN REPOSITORY
+      # ========================================
+      - name: 🔧 Configure Gradle repositories
+        shell: bash
+        run: |
+          mkdir -p ~/.gradle/init.d
+          
+          # Create init script to add required repositories
+          cat > ~/.gradle/init.d/repo-fix.gradle << 'EOF'
+          // Fix for Android and other plugins not found in Gradle Plugin Portal
+          
+          settingsEvaluated { settings ->
+              settings.pluginManagement {
+                  repositories {
+                      // Add Google's Maven (required for Android Gradle Plugin)
+                      google()
+                      // Add Maven Central
+                      mavenCentral()
+                      // Gradle Plugin Portal
+                      gradlePluginPortal()
+                      // JitPack (for GitHub-hosted libraries)
+                      maven { url 'https://jitpack.io' }
+                  }
+              }
+              
+              settings.dependencyResolutionManagement {
+                  repositories {
+                      google()
+                      mavenCentral()
+                      maven { url 'https://jitpack.io' }
+                  }
+              }
+          }
+          
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://jitpack.io' }
+              }
+          }
+          EOF
+          
+          # Create Kotlin DSL version for newer Gradle
+          cat > ~/.gradle/init.d/repo-fix.gradle.kts << 'EOF'
+          // Fix for Android and other plugins not found in Gradle Plugin Portal
+          
+          settingsEvaluated {
+              pluginManagement {
+                  repositories {
+                      google()
+                      mavenCentral()
+                      gradlePluginPortal()
+                      maven("https://jitpack.io")
+                  }
+              }
+          }
+          
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://jitpack.io")
+              }
+          }
+          EOF
+          
+          echo "✅ Gradle init scripts created"
+
+      - name: 🔧 Create local.properties for Android
+        if: steps.detect.outputs.is_android == 'true'
+        shell: bash
+        working-directory: ${{ steps.detect.outputs.work_dir }}
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "✅ local.properties created with SDK path: $ANDROID_HOME"
+
       - name: 🐘 Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: wrapper
           cache-read-only: false
           add-job-summary: always
-          build-scan-publish: ${{ inputs.enable_build_scan }}
-          build-scan-terms-of-use-url: "https://gradle.com/help/legal-terms-of-use"
-          build-scan-terms-of-use-agree: "yes"
-
-      # Handle private dependencies in build.gradle
-      - name: 🔐 Configure Gradle for private repos
-        shell: bash
-        run: |
-          # Create or update gradle.properties with GitHub credentials
-          mkdir -p ~/.gradle
-          
-          # Add GitHub token for GitHub Packages
-          cat >> ~/.gradle/gradle.properties << EOF
-          
-          # GitHub Packages authentication
-          gpr.user=${{ github.actor }}
-          gpr.token=${{ secrets.REPO_ACCESS_TOKEN || github.token }}
-          
-          # Alternative property names some projects use
-          GITHUB_USER=${{ github.actor }}
-          GITHUB_TOKEN=${{ secrets.REPO_ACCESS_TOKEN || github.token }}
-          github.user=${{ github.actor }}
-          github.token=${{ secrets.REPO_ACCESS_TOKEN || github.token }}
-          EOF
-          
-          echo "✅ Gradle credentials configured"
 
       - name: 📦 Install system Gradle (fallback)
         if: steps.detect.outputs.has_wrapper != 'true'
@@ -296,14 +363,30 @@ jobs:
             fi
           fi
 
+      - name: 📋 Show Gradle & project info
+        working-directory: ${{ steps.detect.outputs.work_dir }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.detect.outputs.has_wrapper }}" == "true" ]; then
+            GRADLE_CMD="./gradlew"
+          else
+            GRADLE_CMD="gradle"
+          fi
+          
+          echo "📋 Gradle Version:"
+          $GRADLE_CMD --version || true
+          echo ""
+          echo "📋 Project structure:"
+          $GRADLE_CMD projects 2>/dev/null || true
+
       - name: 🔨 Build with Gradle
         id: build
         working-directory: ${{ steps.detect.outputs.work_dir }}
         shell: bash
         env:
-          # Make token available to Gradle
-          GITHUB_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN || github.token }}
-          GITHUB_ACTOR: ${{ github.actor }}
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
         run: |
           if [ "${{ steps.detect.outputs.has_wrapper }}" == "true" ]; then
             GRADLE_CMD="./gradlew"
@@ -312,10 +395,15 @@ jobs:
             GRADLE_CMD="gradle"
           fi
           
+          TASKS="${{ steps.detect.outputs.default_tasks }}"
+          
           echo "🚀 Building ${{ matrix.repository }}"
+          echo "📋 Tasks: $TASKS"
+          echo "☕ Java: ${{ matrix.java_version }}"
+          echo "📱 Android: ${{ steps.detect.outputs.is_android }}"
           echo "================================================"
           
-          $GRADLE_CMD ${{ matrix.gradle_tasks }} ${{ matrix.gradle_args }} \
+          $GRADLE_CMD $TASKS ${{ matrix.gradle_args }} \
             --info \
             --stacktrace \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:+HeapDumpOnOutOfMemoryError"
@@ -329,6 +417,9 @@ jobs:
             **/build/libs/*.jar
             **/build/libs/*.war
             **/build/distributions/*
+            **/build/outputs/apk/**/*.apk
+            **/build/outputs/bundle/**/*.aab
+            **/build/outputs/aar/*.aar
           if-no-files-found: ignore
           retention-days: 14
 
@@ -338,10 +429,28 @@ jobs:
         with:
           name: tests-${{ steps.detect.outputs.repo_name }}-java${{ matrix.java_version }}
           path: |
-            **/build/reports/tests/**/*
+            **/build/reports/**/*
             **/build/test-results/**/*
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: 📝 Job Summary
+        if: always()
+        shell: bash
+        run: |
+          STATUS="${{ steps.build.outcome }}"
+          ICON="✅"
+          [ "$STATUS" != "success" ] && ICON="❌"
+          
+          echo "## $ICON ${{ matrix.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Java | ${{ matrix.java_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Android | ${{ steps.detect.outputs.is_android }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tasks | \`${{ steps.detect.outputs.default_tasks }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Type | ${{ steps.detect.outputs.build_type }} DSL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | **$STATUS** |" >> $GITHUB_STEP_SUMMARY
 
   summary:
     name: 📊 Build Summary
@@ -360,15 +469,13 @@ jobs:
               run_id: context.runId
             });
             
-            const buildJobs = jobs.data.jobs.filter(j => j.name.includes('Build'));
+            const buildJobs = jobs.data.jobs.filter(j => j.name.includes('Build') && !j.name.includes('Summary'));
             
             let summary = '# 📊 Build Results\n\n';
             summary += '| Repository | Status | Duration |\n';
             summary += '|------------|--------|----------|\n';
             
             for (const job of buildJobs) {
-              if (job.name === '📊 Build Summary') continue;
-              
               const status = job.conclusion === 'success' ? '✅' : 
                             job.conclusion === 'failure' ? '❌' : '⏳';
               const duration = job.completed_at && job.started_at ? 
