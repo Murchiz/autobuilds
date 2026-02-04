@@ -34,7 +34,7 @@ on:
           - '11'
           - '17'
           - '21'
-          - '22'
+          - '25'
       
       java_distribution:
         description: 'Java distribution'
