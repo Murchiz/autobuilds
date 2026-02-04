@@ -1,0 +1,120 @@
+name: Remote Gradle Matrix Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 'Repository to build (format: owner/repo)'
+        required: true
+        type: string
+      ref:
+        description: 'Branch, tag, or commit SHA'
+        required: false
+        default: ''
+        type: string
+      java_versions:
+        description: 'Java versions (comma-separated: 11,17,21)'
+        required: false
+        default: '17,21'
+        type: string
+      gradle_tasks:
+        description: 'Gradle tasks'
+        required: false
+        default: 'build'
+        type: string
+      include_windows:
+        description: 'Include Windows runner'
+        required: false
+        default: false
+        type: boolean
+      include_macos:
+        description: 'Include macOS runner'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set up build matrix
+        id: set-matrix
+        run: |
+          # Parse Java versions
+          IFS=',' read -ra JAVA_VERSIONS <<< "${{ inputs.java_versions }}"
+          
+          # Build OS list
+          OS_LIST='["ubuntu-latest"'
+          if [ "${{ inputs.include_windows }}" == "true" ]; then
+            OS_LIST+=', "windows-latest"'
+          fi
+          if [ "${{ inputs.include_macos }}" == "true" ]; then
+            OS_LIST+=', "macos-latest"'
+          fi
+          OS_LIST+=']'
+          
+          # Build Java list
+          JAVA_LIST='['
+          for i in "${!JAVA_VERSIONS[@]}"; do
+            [ $i -gt 0 ] && JAVA_LIST+=', '
+            JAVA_LIST+="\"${JAVA_VERSIONS[$i]}\""
+          done
+          JAVA_LIST+=']'
+          
+          MATRIX="{\"os\": $OS_LIST, \"java\": $JAVA_LIST}"
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Matrix: $MATRIX"
+
+  build:
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    
+    name: Build (Java ${{ matrix.java }}, ${{ matrix.os }})
+    
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref || '' }}
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        if: runner.os != 'Windows'
+        run: chmod +x ./gradlew || true
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ -f "./gradlew" ] || [ -f "./gradlew.bat" ]; then
+            if [ "$RUNNER_OS" == "Windows" ]; then
+              ./gradlew.bat ${{ inputs.gradle_tasks }} --no-daemon --info
+            else
+              ./gradlew ${{ inputs.gradle_tasks }} --no-daemon --info
+            fi
+          else
+            gradle ${{ inputs.gradle_tasks }} --no-daemon --info
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-java${{ matrix.java }}-${{ matrix.os }}
+          path: |
+            **/build/libs/*.jar
+            **/build/distributions/*
+          if-no-files-found: ignore
