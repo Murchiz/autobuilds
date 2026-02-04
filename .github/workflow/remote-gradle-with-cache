@@ -1,0 +1,80 @@
+name: Reusable Gradle Build
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      ref:
+        required: false
+        type: string
+        default: ''
+      java_version:
+        required: false
+        type: string
+        default: '17'
+      gradle_tasks:
+        required: false
+        type: string
+        default: 'build'
+      gradle_args:
+        required: false
+        type: string
+        default: ''
+      working_directory:
+        required: false
+        type: string
+        default: ''
+      runner:
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      repo_token:
+        required: false
+    outputs:
+      build_status:
+        description: 'Build outcome'
+        value: ${{ jobs.build.outputs.status }}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      status: ${{ steps.gradle-build.outcome }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.repo_token || github.token }}
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          cache: gradle
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        id: gradle-build
+        working-directory: ${{ inputs.working_directory || '.' }}
+        shell: bash
+        run: |
+          chmod +x ./gradlew 2>/dev/null || true
+          
+          if [ -f "./gradlew" ]; then
+            ./gradlew ${{ inputs.gradle_tasks }} ${{ inputs.gradle_args }} --no-daemon
+          else
+            gradle ${{ inputs.gradle_tasks }} ${{ inputs.gradle_args }} --no-daemon
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gradle-build-${{ github.run_number }}
+          path: '**/build/libs/*'
+          if-no-files-found: ignore
