@@ -250,7 +250,7 @@ jobs:
         if: steps.detect.outputs.is_android == 'true'
         uses: android-actions/setup-android@v3
         with:
-          cmdline-tools-version: 11076708
+          cmdline-tools-version: 14742923
           log-accepted-android-sdk-licenses: false
 
       - name: 📱 Accept Android SDK Licenses
