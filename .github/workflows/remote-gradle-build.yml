@@ -4,68 +4,68 @@ on:
   workflow_dispatch:
     inputs:
       repositories:
-        description: 'Repositories to build (comma-separated: owner/repo)'
+        description: 'Repos to build (comma-separated: owner/repo or full URL like https://git.example.org/user/repo)'
         required: true
         type: string
-      
+
       advanced_config:
         description: 'Advanced JSON config (optional)'
         required: false
         type: string
         default: ''
-      
+
       ref:
         description: 'Branch/tag/SHA'
         required: false
         default: ''
         type: string
-      
+
       java_version:
         description: 'Java version'
         required: false
         default: '17'
         type: choice
         options: ['8', '11', '17', '21', '25']
-      
+
       java_distribution:
         description: 'Java distribution'
         required: false
         default: 'temurin'
         type: choice
         options: [temurin, zulu, corretto, liberica, microsoft, oracle]
-      
+
       gradle_tasks:
         description: 'Gradle tasks (auto-detected for Android if empty)'
         required: false
         default: ''
         type: string
-      
+
       gradle_args:
         description: 'Additional Gradle arguments'
         required: false
         default: '--no-daemon'
         type: string
-      
+
       runner_os:
         description: 'Runner OS'
         required: false
         default: 'ubuntu-latest'
         type: choice
         options: [ubuntu-latest, ubuntu-22.04, windows-latest, macos-latest, macos-14]
-      
+
       max_parallel:
         description: 'Max parallel jobs'
         required: false
         default: '5'
         type: choice
         options: ['1', '2', '3', '5', '10', '20']
-      
+
       fail_fast:
         description: 'Fail fast on first failure'
         required: false
         default: false
         type: boolean
-      
+
       upload_artifacts:
         description: 'Upload build artifacts'
         required: false
@@ -82,7 +82,7 @@ jobs:
     outputs:
       matrix: ${{ steps.create-matrix.outputs.matrix }}
       repo_count: ${{ steps.create-matrix.outputs.repo_count }}
-    
+
     steps:
       - name: Create build matrix
         id: create-matrix
@@ -96,22 +96,46 @@ jobs:
             const defaultRef = '${{ inputs.ref }}';
             const defaultArgs = '${{ inputs.gradle_args }}';
             const runnerOs = '${{ inputs.runner_os }}';
-            
+
+            // Classify a repo string: full URL → external, github.com URL → normalized owner/repo, bare owner/repo → GitHub
+            function classifyRepo(raw) {
+              const trimmed = raw.trim();
+
+              // Full GitHub URL → convert to owner/repo so we can use actions/checkout
+              const ghUrl = trimmed.match(/^https?:\/\/(?:www\.)?github\.com\/([^\/]+\/[^\/]+?)(?:\.git)?\/?$/i);
+              if (ghUrl) {
+                return { repository: ghUrl[1], is_external: false };
+              }
+
+              // Any other URL (https://, http://, git://, ssh://) or SCP-style git@host:path
+              if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed) || /^git@/.test(trimmed)) {
+                return { repository: trimmed, is_external: true };
+              }
+
+              // Bare owner/repo – assume GitHub
+              return { repository: trimmed, is_external: false };
+            }
+
             let builds = [];
-            
+
             if (advancedConfig && advancedConfig !== '') {
               try {
                 const config = JSON.parse(advancedConfig);
-                builds = config.map((item, index) => ({
-                  index: index + 1,
-                  repository: item.repo || item.repository,
-                  ref: item.ref || item.branch || defaultRef || '',
-                  java_version: String(item.java || item.java_version || defaultJava),
-                  gradle_tasks: item.tasks || item.gradle_tasks || defaultTasks,
-                  gradle_args: item.args || item.gradle_args || defaultArgs,
-                  subproject: item.subproject || item.path || '',
-                  runner: item.runner || item.os || runnerOs
-                }));
+                builds = config.map((item, index) => {
+                  const repoRaw = item.repo || item.repository;
+                  const { repository, is_external } = classifyRepo(repoRaw);
+                  return {
+                    index: index + 1,
+                    repository,
+                    is_external,
+                    ref: item.ref || item.branch || defaultRef || '',
+                    java_version: String(item.java || item.java_version || defaultJava),
+                    gradle_tasks: item.tasks || item.gradle_tasks || defaultTasks,
+                    gradle_args: item.args || item.gradle_args || defaultArgs,
+                    subproject: item.subproject || item.path || '',
+                    runner: item.runner || item.os || runnerOs
+                  };
+                });
               } catch (e) {
                 core.setFailed(`Invalid JSON config: ${e.message}`);
                 return;
@@ -121,24 +145,28 @@ jobs:
                 .split(',')
                 .map(r => r.trim())
                 .filter(r => r.length > 0);
-              
-              builds = repos.map((repo, index) => ({
-                index: index + 1,
-                repository: repo,
-                ref: defaultRef,
-                java_version: defaultJava,
-                gradle_tasks: defaultTasks,
-                gradle_args: defaultArgs,
-                subproject: '',
-                runner: runnerOs
-              }));
+
+              builds = repos.map((repoRaw, index) => {
+                const { repository, is_external } = classifyRepo(repoRaw);
+                return {
+                  index: index + 1,
+                  repository,
+                  is_external,
+                  ref: defaultRef,
+                  java_version: defaultJava,
+                  gradle_tasks: defaultTasks,
+                  gradle_args: defaultArgs,
+                  subproject: '',
+                  runner: runnerOs
+                };
+              });
             }
-            
+
             if (builds.length === 0) {
               core.setFailed('No repositories specified');
               return;
             }
-            
+
             const matrix = { include: builds };
             core.setOutput('matrix', JSON.stringify(matrix));
             core.setOutput('repo_count', builds.length);
@@ -148,14 +176,16 @@ jobs:
     needs: setup-matrix
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
-    
+
     strategy:
       fail-fast: ${{ inputs.fail_fast }}
       max-parallel: ${{ fromJson(inputs.max_parallel) }}
       matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-    
+
     steps:
-      - name: 📥 Checkout ${{ matrix.repository }}
+      # ── GitHub-hosted repo ───────────────────────────────────────
+      - name: 📥 Checkout ${{ matrix.repository }} (GitHub)
+        if: ${{ !matrix.is_external }}
         uses: actions/checkout@v6
         with:
           repository: ${{ matrix.repository }}
@@ -164,6 +194,32 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      # ── External / non-GitHub repo ───────────────────────────────
+      - name: 📥 Clone ${{ matrix.repository }} (External)
+        if: ${{ matrix.is_external }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO_URL="${{ matrix.repository }}"
+          REF="${{ matrix.ref }}"
+
+          echo "🌐 Cloning external repository: $REPO_URL"
+
+          # Clone with full history and recursive submodules
+          git clone --recursive --depth=0 "$REPO_URL" .
+
+          # Checkout specific ref/branch/tag if provided
+          if [ -n "$REF" ]; then
+            echo "🔀 Checking out ref: $REF"
+            git fetch origin "$REF" || true
+            git checkout "$REF"
+            git submodule update --init --recursive
+          fi
+
+          echo "✅ Clone complete"
+          echo "📌 Current commit: $(git log --oneline -1)"
+
       - name: 🔍 Detect project type
         id: detect
         shell: bash
@@ -171,11 +227,12 @@ jobs:
           WORK_DIR="${{ matrix.subproject }}"
           WORK_DIR="${WORK_DIR:-.}"
           echo "work_dir=$WORK_DIR" >> $GITHUB_OUTPUT
-          
+
           echo "📂 Repository: ${{ matrix.repository }}"
+          echo "🌐 External:   ${{ matrix.is_external }}"
           echo "📁 Working directory: $WORK_DIR"
           echo ""
-          
+
           # Detect wrapper
           if [ -f "$WORK_DIR/gradlew" ]; then
             echo "has_wrapper=true" >> $GITHUB_OUTPUT
@@ -185,7 +242,7 @@ jobs:
             echo "has_wrapper=false" >> $GITHUB_OUTPUT
             echo "⚠️ No wrapper found"
           fi
-          
+
           # Detect build file type
           if [ -f "$WORK_DIR/build.gradle.kts" ]; then
             echo "build_type=kotlin" >> $GITHUB_OUTPUT
@@ -197,29 +254,26 @@ jobs:
             echo "❌ No build.gradle(.kts) found!"
             exit 1
           fi
-          
+
           # ========================================
           # DETECT ANDROID PROJECT
           # ========================================
           IS_ANDROID=false
-          
-          # Check for Android plugin in build files
+
           if grep -rq "com.android.application\|com.android.library\|android {" "$WORK_DIR" --include="*.gradle*" 2>/dev/null; then
             IS_ANDROID=true
           fi
-          
-          # Check for Android directories
+
           if [ -d "$WORK_DIR/app/src/main/AndroidManifest.xml" ] || \
              [ -f "$WORK_DIR/app/src/main/AndroidManifest.xml" ] || \
              find "$WORK_DIR" -name "AndroidManifest.xml" -type f 2>/dev/null | grep -q .; then
             IS_ANDROID=true
           fi
-          
-          # Check for local.properties (Android Studio creates this)
+
           if [ -f "$WORK_DIR/local.properties" ]; then
             IS_ANDROID=true
           fi
-          
+
           if [ "$IS_ANDROID" = true ]; then
             echo "is_android=true" >> $GITHUB_OUTPUT
             echo "📱 Android project detected!"
@@ -227,7 +281,7 @@ jobs:
             echo "is_android=false" >> $GITHUB_OUTPUT
             echo "☕ Standard Java/Kotlin project"
           fi
-          
+
           # Determine default tasks
           if [ -z "${{ matrix.gradle_tasks }}" ]; then
             if [ "$IS_ANDROID" = true ]; then
@@ -238,9 +292,19 @@ jobs:
           else
             echo "default_tasks=${{ matrix.gradle_tasks }}" >> $GITHUB_OUTPUT
           fi
-          
-          # Repo name for artifacts
-          REPO_NAME=$(echo "${{ matrix.repository }}" | tr '/' '-')
+
+          # ========================================
+          # REPO NAME (safe for artifact naming)
+          # ========================================
+          REPO="${{ matrix.repository }}"
+          if [[ "$REPO" == *"://"* ]]; then
+            # Strip protocol, optional trailing .git and slash, replace non-alphanum with -
+            REPO_NAME=$(echo "$REPO" | sed 's|^[a-zA-Z]*://||' | sed 's|\.git/*$||' | sed 's|/$||' | tr '/.:@' '-')
+          elif [[ "$REPO" == git@* ]]; then
+            REPO_NAME=$(echo "$REPO" | sed 's|^git@||' | sed 's|\.git$||' | tr '/:@' '-')
+          else
+            REPO_NAME=$(echo "$REPO" | tr '/' '-')
+          fi
           echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
 
       # ========================================
@@ -273,25 +337,18 @@ jobs:
         shell: bash
         run: |
           mkdir -p ~/.gradle/init.d
-          
-          # Create init script to add required repositories
+
           cat > ~/.gradle/init.d/repo-fix.gradle << 'EOF'
-          // Fix for Android and other plugins not found in Gradle Plugin Portal
-          
           settingsEvaluated { settings ->
               settings.pluginManagement {
                   repositories {
-                      // Add Google's Maven (required for Android Gradle Plugin)
                       google()
-                      // Add Maven Central
                       mavenCentral()
-                      // Gradle Plugin Portal
                       gradlePluginPortal()
-                      // JitPack (for GitHub-hosted libraries)
                       maven { url 'https://jitpack.io' }
                   }
               }
-              
+
               settings.dependencyResolutionManagement {
                   repositories {
                       google()
@@ -300,7 +357,7 @@ jobs:
                   }
               }
           }
-          
+
           allprojects {
               repositories {
                   google()
@@ -309,11 +366,8 @@ jobs:
               }
           }
           EOF
-          
-          # Create Kotlin DSL version for newer Gradle
+
           cat > ~/.gradle/init.d/repo-fix.gradle.kts << 'EOF'
-          // Fix for Android and other plugins not found in Gradle Plugin Portal
-          
           settingsEvaluated {
               pluginManagement {
                   repositories {
@@ -324,7 +378,7 @@ jobs:
                   }
               }
           }
-          
+
           allprojects {
               repositories {
                   google()
@@ -333,7 +387,7 @@ jobs:
               }
           }
           EOF
-          
+
           echo "✅ Gradle init scripts created"
 
       - name: 🔧 Create local.properties for Android
@@ -373,7 +427,7 @@ jobs:
           else
             GRADLE_CMD="gradle"
           fi
-          
+
           echo "📋 Gradle Version:"
           $GRADLE_CMD --version || true
           echo ""
@@ -394,15 +448,16 @@ jobs:
           else
             GRADLE_CMD="gradle"
           fi
-          
+
           TASKS="${{ steps.detect.outputs.default_tasks }}"
-          
+
           echo "🚀 Building ${{ matrix.repository }}"
+          echo "🌐 External: ${{ matrix.is_external }}"
           echo "📋 Tasks: $TASKS"
           echo "☕ Java: ${{ matrix.java_version }}"
           echo "📱 Android: ${{ steps.detect.outputs.is_android }}"
           echo "================================================"
-          
+
           $GRADLE_CMD $TASKS ${{ matrix.gradle_args }} \
             --info \
             --stacktrace \
@@ -441,11 +496,12 @@ jobs:
           STATUS="${{ steps.build.outcome }}"
           ICON="✅"
           [ "$STATUS" != "success" ] && ICON="❌"
-          
+
           echo "## $ICON ${{ matrix.repository }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Source | ${{ matrix.is_external && '🌐 External' || '🐙 GitHub' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Java | ${{ matrix.java_version }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Android | ${{ steps.detect.outputs.is_android }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Tasks | \`${{ steps.detect.outputs.default_tasks }}\` |" >> $GITHUB_STEP_SUMMARY
@@ -457,7 +513,7 @@ jobs:
     needs: [setup-matrix, build]
     runs-on: ubuntu-latest
     if: always()
-    
+
     steps:
       - name: Generate summary
         uses: actions/github-script@v8
@@ -468,21 +524,21 @@ jobs:
               repo: context.repo.repo,
               run_id: context.runId
             });
-            
+
             const buildJobs = jobs.data.jobs.filter(j => j.name.includes('Build') && !j.name.includes('Summary'));
-            
+
             let summary = '# 📊 Build Results\n\n';
             summary += '| Repository | Status | Duration |\n';
             summary += '|------------|--------|----------|\n';
-            
+
             for (const job of buildJobs) {
-              const status = job.conclusion === 'success' ? '✅' : 
+              const status = job.conclusion === 'success' ? '✅' :
                             job.conclusion === 'failure' ? '❌' : '⏳';
-              const duration = job.completed_at && job.started_at ? 
+              const duration = job.completed_at && job.started_at ?
                 Math.round((new Date(job.completed_at) - new Date(job.started_at)) / 1000) + 's' : '-';
               const name = job.name.replace('🔨 Build ', '');
-              
+
               summary += `| \`${name}\` | ${status} | ${duration} |\n`;
             }
-            
+
             await core.summary.addRaw(summary).write();
