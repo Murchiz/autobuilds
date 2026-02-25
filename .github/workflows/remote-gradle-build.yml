@@ -207,7 +207,7 @@ jobs:
           echo "🌐 Cloning external repository: $REPO_URL"
 
           # Clone with full history and recursive submodules
-          git clone --recursive --depth=0 "$REPO_URL" .
+          git clone --recursive "$REPO_URL" .
 
           # Checkout specific ref/branch/tag if provided
           if [ -n "$REF" ]; then
