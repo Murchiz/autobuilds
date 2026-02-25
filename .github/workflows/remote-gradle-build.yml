@@ -339,6 +339,8 @@ jobs:
           mkdir -p ~/.gradle/init.d
 
           cat > ~/.gradle/init.d/repo-fix.gradle << 'EOF'
+          // Additive repository configuration — does NOT override project settings
+          
           settingsEvaluated { settings ->
               settings.pluginManagement {
                   repositories {
@@ -348,17 +350,16 @@ jobs:
                       maven { url 'https://jitpack.io' }
                   }
               }
-
-              settings.dependencyResolutionManagement {
+          }
+          
+          allprojects {
+              buildscript {
                   repositories {
                       google()
                       mavenCentral()
                       maven { url 'https://jitpack.io' }
                   }
               }
-          }
-
-          allprojects {
               repositories {
                   google()
                   mavenCentral()
@@ -380,6 +381,13 @@ jobs:
           }
 
           allprojects {
+              buildscript {
+                  repositories {
+                      google()
+                      mavenCentral()
+                      maven("https://jitpack.io")
+                  }
+              }
               repositories {
                   google()
                   mavenCentral()
@@ -388,7 +396,7 @@ jobs:
           }
           EOF
 
-          echo "✅ Gradle init scripts created"
+          echo "✅ Gradle init scripts created (additive only)"
 
       - name: 🔧 Create local.properties for Android
         if: steps.detect.outputs.is_android == 'true'
