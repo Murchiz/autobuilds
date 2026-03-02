@@ -111,7 +111,7 @@ jobs:
           fi
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: build-java${{ matrix.java }}-${{ matrix.os }}
           path: |
