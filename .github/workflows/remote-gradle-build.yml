@@ -473,7 +473,7 @@ jobs:
 
       - name: 📦 Upload artifacts
         if: inputs.upload_artifacts && always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: build-${{ steps.detect.outputs.repo_name }}-java${{ matrix.java_version }}
           path: |
@@ -488,7 +488,7 @@ jobs:
 
       - name: 📊 Upload test reports
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: tests-${{ steps.detect.outputs.repo_name }}-java${{ matrix.java_version }}
           path: |
